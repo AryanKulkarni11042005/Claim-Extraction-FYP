@@ -363,12 +363,7 @@ def extract_claims(text):
 # ==========================================
 if __name__ == "__main__":
     test_text = '''
-Apple acquired Beats Electronics in 2014 for $3 billion. 
-The company later used its technology in several products.
-Microsoft acquired GitHub in 2018. 
-It later integrated GitHub Copilot into several of its products.
-Elon Musk founded SpaceX in 2002. 
-He later became the CEO of Tesla.
+Google was founded in 1998. Larry Page and Sergey Brin founded the company. It is one of the best companies in the world
     '''
     
     print("Starting Claimify Pipeline...")

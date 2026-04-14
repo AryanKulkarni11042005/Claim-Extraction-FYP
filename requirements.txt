@@ -28,6 +28,7 @@ preshed==3.0.13
 pydantic==2.13.0
 pydantic_core==2.46.0
 Pygments==2.20.0
+python-dotenv==1.2.2
 requests==2.33.1
 rich==15.0.0
 shellingham==1.5.4
