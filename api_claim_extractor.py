@@ -2,12 +2,17 @@ import requests
 import json
 import re
 import spacy
+import os 
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_NAME = "qwen2.5:7b"
-ENDPOINT = "http://localhost:11434/api/chat"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+MODEL_NAME = "openai/gpt-oss-120b:free"
+ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 # Initialize spaCy
 try:
@@ -21,21 +26,21 @@ except OSError:
 # HELPER FUNCTIONS
 # ==========================================
 def call_model(prompt):
-    """Sends a POST request to local Ollama and returns the assistant's message."""
+    """Sends a POST request to OpenRouter and returns the assistant's message."""
     headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
     data = {
         "model": MODEL_NAME,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "stream": False
+        "temperature": 0
     }
     
     try:
         response = requests.post(ENDPOINT, headers=headers, json=data)
         response.raise_for_status()
-        content = response.json().get('message', {}).get('content', '')
+        content = response.json()['choices'][0]['message']['content']
         print(f"  [DEBUG] Raw Model Output:\n  {content.strip()}\n")
         return content
     except Exception as e:
@@ -123,11 +128,13 @@ def extract_context_entities(context_text, nlp_model):
     # Find main grammatical subject using dependency parsing
     for token in doc:
         if token.dep_ in ("nsubj", "nsubjpass"):
+            # Check if this token belongs to a named entity
             for ent in doc.ents:
                 if ent.start <= token.i < ent.end:
                     entities["main_subject"] = ent.text
                     break
             
+            # Fallback to the token's text if no named entity matches (and it's not a pronoun)
             if not entities["main_subject"] and token.pos_ in ("PROPN", "NOUN"):
                 entities["main_subject"] = token.text
                 
@@ -141,6 +148,7 @@ def simple_reference_resolution(sentence, context_text, nlp_model):
     if not context_text.strip():
         return sentence
 
+    # 1. Extract context data
     context_data = extract_context_entities(context_text, nlp_model)
     main_subject = context_data["main_subject"]
     recent_org = context_data["recent_org"]
@@ -148,21 +156,30 @@ def simple_reference_resolution(sentence, context_text, nlp_model):
 
     resolved = sentence
 
+    # 2. Sentence-initial references -> usually main_subject of the previous sentence
     if main_subject:
         resolved = re.sub(r'^([Ii]t|[Tt]hey|[Tt]he company|[Tt]he organization)\b', main_subject, resolved)
     elif recent_org:
         resolved = re.sub(r'^([Ii]t|[Tt]hey|[Tt]he company|[Tt]he organization)\b', recent_org, resolved)
 
+    # 3. Person pronouns -> recent_person
     if recent_person:
         resolved = re.sub(r'\b([Hh]e|[Ss]he)\b', recent_person, resolved)
         resolved = re.sub(r'^([Hh]e|[Ss]he)\b', recent_person, resolved)
 
+    # 4. Context-dependent Possessive rules ("its", "their")
     if recent_org and main_subject and recent_org != main_subject:
+        # Tech/Founder of acquired/recent company
         resolved = re.sub(r'\b(?:its|their) (technology|software|founder)\b', f"{recent_org} \\1", resolved)
+        
+        # Products/Services belonging to the main acting entity
         resolved = re.sub(r'\b(?:its|their) (products|services|offerings)\b', f"{main_subject} \\1", resolved)
 
+    # 5. Catch-all remainders
     if main_subject:
+        # Any remaining "its/their" -> main_subject's
         resolved = re.sub(r'\b(?:its|their)\b', f"{main_subject}'s", resolved)
+        # Any remaining "the company" anywhere in the sentence
         resolved = re.sub(r'\b[Tt]he company\b', main_subject, resolved)
         
     return resolved
@@ -200,13 +217,7 @@ def disambiguation_stage(sentence, context):
 Context: {context}
 Sentence: {sentence}
 
-Instructions:
-- Resolve vague references naturally using the context. Reject unresolved ambiguity.
-- If the sentence already contains explicit named entities, keep them unchanged.
-- Never replace a named entity with a more vague phrase such as: "the company", "the organization", "it", "they".
-- Prefer the main subject from the previous sentence for sentence-initial references like: "It", "They", "The company".
-- Keep the resolved sentence in natural English.
-
+Instructions: Resolve vague references naturally using the context. Reject unresolved ambiguity.
 Output ONLY a JSON object in this format:
 {{"can_disambiguate": true, "resolved_sentence": "..."}}"""
     
@@ -226,11 +237,6 @@ Instructions: Split the sentence into standalone factual claims. Preserve all da
 - Prefer one clear claim in active voice.
 - Preserve the original wording and order when possible.
 - If two possible claims are semantically identical, return only the simpler one.
-- Preserve all resolved named entities exactly as they appear in the input sentence.
-- Never replace "Microsoft" with "the company".
-- Never replace "Apple" with "the organization".
-- Never introduce new vague references.
-- If the input sentence is already a single clear factual claim, return exactly one claim with the same wording.
 
 Examples:
 Input sentence:
@@ -244,18 +250,11 @@ Correct output:
 }}
 
 Input sentence:
-"Microsoft later integrated GitHub Copilot into several of Microsoft's products."
+"Microsoft later integrated GitHub Copilot into several of its products."
 Correct output:
 {{
   "claims": [
-    "Microsoft later integrated GitHub Copilot into several of Microsoft's products."
-  ]
-}}
-
-Incorrect output:
-{{
-  "claims": [
-    "Company later integrated GitHub Copilot into several of the company's products."
+    "Microsoft later integrated GitHub Copilot into several Microsoft products."
   ]
 }}
 
@@ -339,17 +338,8 @@ def extract_claims(text):
                 seen.add(normalized)
                 unique_claims.append(claim)
 
-        # SAFEGUARD 4: Reverse vague entities introduced by model
-        final_processed_claims = []
-        for claim in unique_claims:
-            if "company" in claim.lower() and any(org in working_sentence for org in ["Microsoft", "Apple", "Google", "OpenAI", "SpaceX"]):
-                print(f"  [Safeguard] Model introduced vague 'company' reference. Reverting to working sentence.")
-                final_processed_claims.append(working_sentence)
-            else:
-                final_processed_claims.append(claim)
-
         # Append unique claims to final list
-        for claim in final_processed_claims:
+        for claim in unique_claims:
             final_claims.append({
                 "source_sentence": sentence,
                 "claim": claim
@@ -361,6 +351,7 @@ def extract_claims(text):
 # EXECUTION
 # ==========================================
 if __name__ == "__main__":
+    # Expanded test text to ensure general rules work across different contexts
     test_text = '''
 Apple acquired Beats Electronics in 2014 for $3 billion. 
 The company later used its technology in several products.
