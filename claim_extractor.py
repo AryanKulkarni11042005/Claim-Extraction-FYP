@@ -6,7 +6,8 @@ import spacy
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_NAME = "qwen2.5:7b"
+MODEL_NAME = "qwen2.5:7b"  
+
 ENDPOINT = "http://localhost:11434/api/chat"
 
 # Initialize spaCy
