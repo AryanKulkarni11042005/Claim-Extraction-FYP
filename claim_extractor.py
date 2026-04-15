@@ -173,24 +173,55 @@ def simple_reference_resolution(sentence, context_text, nlp_model):
 # ==========================================
 def selection_stage(sentence, context):
     prompt = f"""Task: Selection
-Context: {context}
-Sentence: {sentence}
+You are a factual claim selector.
+You will receive:
 
-Instructions: 
-- Keep only factual, verifiable content. Remove speculation/opinion.
-- Reject statements describing intentions, promises, goals, plans, or expected future outcomes.
-- Reject sentences containing phrases like: "would", "could", "might", "may", "expected to", "planned to", "intended to", "said it would", "said they would", "aims to", "hopes to", "will help".
+Context: nearby sentences
+Sentence: the current sentence only
 
-Example:
-Input sentence:
-"The company said it would help developers collaborate more effectively."
-Correct output:
-{{
-  "has_claim": false,
-  "clean_sentence": ""
-}}
+Your job:
+Determine whether the Sentence contains a specific and verifiable factual proposition.
+Use Context only to understand ambiguous references.
+Never copy facts from Context unless they are explicitly referred to in the Sentence.
+Reject:
+opinions
+praise
+rankings
+speculation
+introductions
+conclusions
+statements about future possibilities
+If the Sentence contains both factual and non-factual content, keep only the factual part.
 
-Output ONLY a JSON object in this format:
+Examples:
+Sentence:
+"Google was founded in 1998."
+Output:
+{{"has_claim": true, "clean_sentence": "Google was founded in 1998."}}
+
+Sentence:
+"It is one of the best companies in the world."
+Output:
+{{"has_claim": false, "clean_sentence": ""}}
+
+Sentence:
+"The company later used its technology in several products."
+Context:
+"Apple acquired Beats Electronics in 2014 for $3 billion."
+Output:
+{{"has_claim": true, "clean_sentence": "The company later used its technology in several products."}}
+
+Sentence:
+"Some experts estimate inflation could rise to 300%."
+Output:
+{{"has_claim": false, "clean_sentence": ""}}
+
+Sentence:
+"{sentence}"
+Context:
+"{context}"
+
+Return ONLY JSON:
 {{"has_claim": true, "clean_sentence": "..."}}"""
     
     response = call_model(prompt)
@@ -221,6 +252,7 @@ Sentence: {sentence}
 Instructions: Split the sentence into standalone factual claims. Preserve all dates, numbers, money values, and names. 
 - Never use pronouns in final claims.
 - Never use vague references such as "the contract", "the company", "it", "they", "this", or "that".
+- All claims MUST be derived SOLELY from the provided 'Sentence'. Do NOT introduce information from previous sentences or external knowledge.
 - Every claim must be understandable in complete isolation.
 - Repeat the relevant subject or entity if needed.
 - Do not produce multiple claims that express the same fact in different wording.
@@ -260,6 +292,16 @@ Incorrect output:
   ]
 }}
 
+Incorrect output (due to hallucination/using external knowledge):
+Input sentence:
+"Google is one of the best companies in the world."
+Incorrect output:
+{{
+  "claims": [
+    "Google was founded in 1998."
+  ]
+}}
+
 Output ONLY a JSON object in this format:
 {{"claims": ["...", "..."]}}"""
     
@@ -288,6 +330,14 @@ def extract_claims(text):
         # SAFEGUARD 1: Check for empty or whitespace-only clean_sentence
         if not clean_sentence or clean_sentence.strip() == "":
             selection_result["has_claim"] = False
+
+        # SAFEGUARD 1.5: Reject if the model copied most of the context instead of using the sentence
+        if clean_sentence and context:
+            if clean_sentence.strip() in context:
+                print("  [Safeguard] Selection copied context instead of current sentence.")
+                selection_result["has_claim"] = False
+                selection_result["clean_sentence"] = ""
+                clean_sentence = ""
             
         # SAFEGUARD 2: Pattern matching for non-factual statements
         clean_lower = clean_sentence.lower()
@@ -340,17 +390,46 @@ def extract_claims(text):
                 seen.add(normalized)
                 unique_claims.append(claim)
 
-        # SAFEGUARD 4: Reverse vague entities introduced by model
-        final_processed_claims = []
+        # SAFEGUARD 4: Reject claims that introduce forbidden vague references
+        # This safeguard checks if the LLM introduced vague references despite prompt instructions.
+        vague_terms_to_reject = [" the company", " the organization", " it", " they", " this", " that", " the contract"]
+
+        filtered_claims_s4 = []
         for claim in unique_claims:
-            if "company" in claim.lower() and any(org in working_sentence for org in ["Microsoft", "Apple", "Google", "OpenAI", "SpaceX"]):
-                print(f"  [Safeguard] Model introduced vague 'company' reference. Reverting to working sentence.")
-                final_processed_claims.append(working_sentence)
+            is_vague_introduction = False
+            claim_lower = claim.lower()
+            working_sentence_lower = working_sentence.lower()
+
+            for term in vague_terms_to_reject:
+                if term in claim_lower and term not in working_sentence_lower:
+                    print(f"  [Safeguard 4] Claim '{claim}' introduced forbidden vague reference: '{term.strip()}'")
+                    is_vague_introduction = True
+                    break
+
+            if not is_vague_introduction:
+                filtered_claims_s4.append(claim)
             else:
-                final_processed_claims.append(claim)
+                print(f"  -> Rejecting claim due to introduced vague reference: '{claim}'")
+
+        # SAFEGUARD 5: Check for hallucination (claim content not present in working_sentence)
+        final_verified_claims = []
+        for claim in filtered_claims_s4:
+            claim_doc = nlp(claim)
+            working_sentence_doc = nlp(working_sentence)
+
+            claim_key_elements = {ent.text.lower() for ent in claim_doc.ents if ent.label_ in ["ORG", "PERSON", "DATE", "GPE", "NORP", "PRODUCT", "EVENT", "LOC"]}.union({token.text for token in claim_doc if token.like_num})
+            working_sentence_key_elements = {ent.text.lower() for ent in working_sentence_doc.ents if ent.label_ in ["ORG", "PERSON", "DATE", "GPE", "NORP", "PRODUCT", "EVENT", "LOC"]}.union({token.text for token in working_sentence_doc if token.like_num})
+
+            if not claim_key_elements.issubset(working_sentence_key_elements):
+                print(f"  [Safeguard 5] Potential hallucination detected in claim: '{claim}'")
+                print(f"    Claim key elements: {claim_key_elements}")
+                print(f"    Working sentence key elements: {working_sentence_key_elements}")
+                print(f"  -> Rejecting potentially hallucinated claim: '{claim}'")
+            else:
+                final_verified_claims.append(claim)
 
         # Append unique claims to final list
-        for claim in final_processed_claims:
+        for claim in final_verified_claims:
             final_claims.append({
                 "source_sentence": sentence,
                 "claim": claim
@@ -363,8 +442,7 @@ def extract_claims(text):
 # ==========================================
 if __name__ == "__main__":
     test_text = '''
-Google was founded in 1998. Larry Page and Sergey Brin founded the company. It is one of the best companies in the world
-    '''
+Amazon was founded by Jeff Bezos in 1994. The company is headquartered in Seattle, Washington.'''
     
     print("Starting Claimify Pipeline...")
     results = extract_claims(test_text)
